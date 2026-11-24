@@ -6,6 +6,8 @@ Remove the background from any photo: drag in up to 20 photos at once, get full-
 
 remove.bg shuts down on 1 December 2026. BG Rescue is built to stay free — there is no server to pay for, so there is nothing to shut down.
 
+[![☕ Support Me](https://img.shields.io/badge/%E2%98%95_Support_Me-FFDD00?style=for-the-badge)](https://www.supportkori.com/hellomdayub)
+
 ## Try it
 
 **Live site:** https://visualfizzagency.github.io/bg-rescue/ *(GitHub Pages — enable in repo settings after cloning, or host anywhere static)*
