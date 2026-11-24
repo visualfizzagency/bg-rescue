@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: Inter, -apple-system, "Segoe UI", Roboto, sans-serif; color: #1d1d1f; padding: 16px; }
+  h1 { font-size: 15px; margin: 0 0 4px; }
+  h1 span { color: #0b8a5f; }
+  p { font-size: 12px; color: #666; margin: 0 0 12px; line-height: 1.5; }
+  #status { font-size: 13px; font-weight: 600; margin: 10px 0 6px; min-height: 18px; }
+  .bar { height: 8px; background: #eee; border-radius: 99px; overflow: hidden; }
+  .bar > div { height: 100%; width: 0%; background: #0b8a5f; transition: width .2s; }
+  .note { font-size: 11px; color: #999; margin-top: 12px; }
+  button { margin-top: 12px; font: inherit; font-size: 12px; font-weight: 600; border: 1px solid #ddd; background: #fff; border-radius: 8px; padding: 6px 12px; cursor: pointer; }
+</style>
+</head>
+<body>
+<h1>BG Rescue <span>— free background remover</span></h1>
+<p>Removes the background from the selected image, right here in Figma. The AI model downloads once (~94–183 MB) and everything runs on your device — no uploads.</p>
+<div id="status">Starting…</div>
+<div class="bar"><div id="fill"></div></div>
+<p class="note">Engine: BiRefNet (MIT) via ONNX Runtime Web. Your image never leaves this computer.</p>
+<button id="closeBtn" type="button">Close</button>
+<script type="module">
+  // Same engine as the BG Rescue web tool (bg-rescue, MIT).
+  const MODEL_ID = 'studioludens/birefnet-lite-512';
+  const TRANSFORMERS_URLS = [
+    'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.2/dist/transformers.min.js',
+    'https://unpkg.com/@huggingface/transformers@4.3.2/dist/transformers.min.js',
+  ];
+  const INFER_SIZE = 512;
+  const MEAN = [0.485, 0.456, 0.406];
+  const STD = [0.229, 0.224, 0.225];
+
+  const statusEl = document.getElementById('status');
+  const fillEl = document.getElementById('fill');
+  let transformers = null;
+  let model = null;
+  let modelLoading = null;
+
+  function setStatus(text, progress) {
+    statusEl.textContent = text;
+    if (typeof progress === 'number') fillEl.style.width = Math.max(0, Math.min(100, progress)) + '%';
+  }
+  function send(msg) { parent.postMessage({ pluginMessage: msg }, '*'); }
+
+  async function loadTransformers() {
+    if (transformers) return transformers;
+    let lastErr = null;
+    for (const url of TRANSFORMERS_URLS) {
+      try { transformers = await import(url); return transformers; }
+      catch (e) { lastErr = e; }
+    }
+    throw new Error('Could not load the AI library. Check your connection. ' + (lastErr?.message || ''));
+  }
+
+  async function loadModel() {
+    if (model) return model;
+    if (modelLoading) return modelLoading;
+    modelLoading = (async () => {
+      const tf = await loadTransformers();
+      const attempts = navigator.gpu
+        ? [{ device: 'webgpu', dtype: 'fp16' }, { device: 'wasm', dtype: 'fp32' }]
+        : [{ device: 'wasm', dtype: 'fp32' }];
+      let lastErr = null;
+      for (const opts of attempts) {
+        try {
+          setStatus(`Downloading AI model (${opts.dtype === 'fp16' ? '94 MB' : '183 MB'}, one time only)…`, 0);
+          model = await tf.AutoModel.from_pretrained(MODEL_ID, {
+            dtype: opts.dtype,
+            device: opts.device,
+            progress_callback: (p) => {
+              if (p.status === 'progress' && p.file && p.file.includes('model') && p.total) {
+                setStatus(`Downloading AI model… ${Math.round((p.loaded / p.total) * 100)}%`, (p.loaded / p.total) * 100);
+              }
+            },
+          });
+          setStatus(`AI model ready (${opts.device === 'webgpu' ? 'GPU' : 'CPU'} mode).`);
+          return model;
+        } catch (e) { lastErr = e; }
+      }
+      throw new Error('Could not load the AI model. ' + (lastErr?.message || ''));
+    })();
+    try { return await modelLoading; } finally { modelLoading = null; }
+  }
+
+  async function removeBackground(bytes) {
+    const blob = new Blob([bytes]);
+    const bmp = await createImageBitmap(blob);
+    const w = bmp.width, h = bmp.height;
+    const mdl = await loadModel();
+
+    // Preprocess: 512x512, ImageNet normalise.
+    const c = document.createElement('canvas');
+    c.width = INFER_SIZE; c.height = INFER_SIZE;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(bmp, 0, 0, INFER_SIZE, INFER_SIZE);
+    const px = ctx.getImageData(0, 0, INFER_SIZE, INFER_SIZE).data;
+    const data = new Float32Array(3 * INFER_SIZE * INFER_SIZE);
+    for (let i = 0; i < INFER_SIZE * INFER_SIZE; i++) {
+      data[i] = (px[i * 4] / 255 - MEAN[0]) / STD[0];
+      data[INFER_SIZE * INFER_SIZE + i] = (px[i * 4 + 1] / 255 - MEAN[1]) / STD[1];
+      data[2 * INFER_SIZE * INFER_SIZE + i] = (px[i * 4 + 2] / 255 - MEAN[2]) / STD[2];
+    }
+    const tensor = new transformers.Tensor('float32', data, [1, 3, INFER_SIZE, INFER_SIZE]);
+    const out = await mdl({ input_image: tensor });
+    const logits = (out.output_image || out.logits || Object.values(out)[0]).data;
+
+    // Sigmoid -> mask, upscale to full size, composite.
+    const maskSmall = document.createElement('canvas');
+    maskSmall.width = INFER_SIZE; maskSmall.height = INFER_SIZE;
+    const mctx = maskSmall.getContext('2d', { willReadFrequently: true });
+    const mimg = mctx.createImageData(INFER_SIZE, INFER_SIZE);
+    for (let i = 0; i < logits.length; i++) {
+      const v = Math.round((1 / (1 + Math.exp(-logits[i]))) * 255);
+      mimg.data[i * 4] = v; mimg.data[i * 4 + 1] = v; mimg.data[i * 4 + 2] = v; mimg.data[i * 4 + 3] = 255;
+    }
+    mctx.putImageData(mimg, 0, 0);
+
+    const outCanvas = document.createElement('canvas');
+    outCanvas.width = w; outCanvas.height = h;
+    const octx = outCanvas.getContext('2d', { willReadFrequently: true });
+    octx.drawImage(bmp, 0, 0, w, h);
+    const imgData = octx.getImageData(0, 0, w, h);
+    const maskFull = document.createElement('canvas');
+    maskFull.width = w; maskFull.height = h;
+    const mfctx = maskFull.getContext('2d', { willReadFrequently: true });
+    mfctx.imageSmoothingEnabled = true;
+    mfctx.imageSmoothingQuality = 'high';
+    mfctx.drawImage(maskSmall, 0, 0, w, h);
+    const maskData = mfctx.getImageData(0, 0, w, h).data;
+    const d = imgData.data;
+    for (let i = 0; i < d.length; i += 4) {
+      const a = maskData[i];
+      d[i + 3] = a < 5 ? 0 : a;
+    }
+    octx.putImageData(imgData, 0, 0);
+    const outBlob = await new Promise((res) => outCanvas.toBlob(res, 'image/png'));
+    return new Uint8Array(await outBlob.arrayBuffer());
+  }
+
+  onmessage = async (event) => {
+    const msg = event.data?.pluginMessage;
+    if (!msg) return;
+    if (msg.type === 'status') { setStatus(msg.message); return; }
+    if (msg.type === 'error') { setStatus(msg.message); return; }
+    if (msg.type === 'process') {
+      try {
+        setStatus(`Removing background — ${msg.name}…`);
+        const png = await removeBackground(msg.bytes);
+        setStatus('Done — background removed.');
+        fillEl.style.width = '100%';
+        send({ type: 'done', id: msg.id, name: msg.name, png });
+      } catch (e) {
+        setStatus('Failed: ' + (e.message || e));
+        send({ type: 'failed', id: msg.id, error: e.message || String(e) });
+      }
+    }
+  };
+
+  document.getElementById('closeBtn').addEventListener('click', () => send({ type: 'close' }));
+  send({ type: 'ready' });
+</script>
+</body>
+</html>

@@ -1,0 +1,5 @@
+# local test artefacts — never commit
+.test-models/
+tests/output/
+tests/*.png
+.DS_Store
